@@ -1,0 +1,137 @@
+# shp_validity
+
+A Python utility for validating, repairing, and cleaning geometries in
+ESRI shapefiles. Designed for GIS and remote sensing workflows where
+vector products — classification polygons, water masks, field boundaries —
+often arrive with messy topology, mixed geometry types, and the
+occasional null geometry.
+
+The script is interactive: run it from a directory containing one or
+more shapefiles, pick the one to clean, and it produces a tidy
+`cleaned/` subdirectory with the valid features, any rejected features
+(split by geometry type), and a per-feature CSV audit log.
+
+## Features
+
+- Interactive prompts — no command-line flags to remember.
+- Validates every feature with Shapely's `is_valid` and `explain_validity`.
+- Two-stage geometry repair: `make_valid()` first, then `buffer(0)` as a fallback.
+- Drops non-polygon geometries (points, lines, etc.) and routes them to a separate rejected file.
+- Extracts polygon parts from any `GeometryCollection` produced during repair.
+- Optionally adds a boolean `repaired` field to the valid output so you can filter / symbolize repaired features in QGIS or ArcGIS. Decline the prompt to keep the output attributes identical to the input (repair status is still recorded in the CSV report).
+- Per-feature CSV audit log includes a user-selected identifier column for cross-reference.
+- Robustness handling for missing CRS, Z/M dimensions, field-name collisions, encoding issues, and mixed singlepart/multipart output.
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+Requires Python 3.9 or later and Shapely 2.0+ (for `force_2d` and the
+modern `make_valid` behavior).
+
+## Try it out
+
+Drop a small shapefile into `sample_data/` and run the script there to
+see the whole pipeline without touching your real working data:
+
+```bash
+cd sample_data
+python ../shp_validity.py
+```
+
+Results land in `sample_data/cleaned/`, which is git-ignored, so demo
+runs never get committed. See [`sample_data/README.md`](sample_data/README.md).
+
+## Usage
+
+Open a terminal in the directory containing your shapefile and run:
+
+```bash
+python shp_validity.py
+```
+
+The script will:
+
+1. List the `.shp` files in the current working directory and ask which one to clean.
+2. Ask whether to write the CSV audit report.
+3. Ask whether to add a `repaired` flag field to the valid output (decline to keep the output attributes identical to the input).
+4. Warn you if the input has no `.prj` (missing CRS) and ask whether to proceed.
+5. Strip any Z / M dimensions automatically (with a note).
+6. Show the input's attribute columns and ask which one to use as a feature identifier in the CSV report.
+7. Run the validation and repair pipeline.
+8. Print a summary of what happened to each feature.
+
+If you add the flag and your input already has a `repaired` column, the script picks a non-conflicting name (`was_fixed`, etc.) and tells you which it used.
+
+See [example_usage.md](example_usage.md) for a full walkthrough with
+sample console output.
+
+## Outputs
+
+All outputs land in a `cleaned/` subdirectory next to the input shapefile:
+
+| File | Contents |
+| --- | --- |
+| `<name>_valid.shp` | Valid `(Multi)Polygon` features, including features that were successfully repaired. Has a boolean `repaired` field unless you decline that prompt. |
+| `<name>_rejected_poly.shp` | Polygons that could not be repaired (only created if any exist). |
+| `<name>_rejected_line.shp` | Filtered `(Multi)LineString` features (only created if any exist). |
+| `<name>_rejected_point.shp` | Filtered `(Multi)Point` features (only created if any exist). |
+| `<name>_report.csv` | Per-feature audit log — the place to look up exactly why a feature ended up where it did. |
+
+The CSV report contains one row per input feature with the columns:
+`row_idx`, `<your_id_field>` (if you picked one), `original_type`,
+`was_valid`, `status`, `repaired`, and `validity_msg`.
+
+The `status` column uses these descriptive tags:
+
+| Status | Meaning |
+| --- | --- |
+| `valid_original` | Feature was already valid; untouched. |
+| `repaired_make_valid` | Repaired by `shapely.validation.make_valid()`. |
+| `repaired_collection_extracted` | `make_valid()` produced a `GeometryCollection`; only the polygon parts were kept (line / point fragments discarded). |
+| `repaired_buffer0` | Repaired by `geom.buffer(0)` after `make_valid()` failed. |
+| `unrepairable` | Started as a polygon but neither repair method produced a valid result. |
+| `null_geom` | Geometry was null / NaN. |
+| `empty_geom` | Geometry was empty (no coordinates). |
+| `wrong_type_point` etc. | Original geometry was not a polygon (point, line, etc.). |
+
+## Repair pipeline
+
+For each feature with a polygon-like input:
+
+1. **`make_valid()`** — Shapely's modern geometry repair. Handles most real-world breakage (self-intersections, bowties, repeated vertices).
+2. **Extract polygon parts** — if `make_valid()` returns a `GeometryCollection` (common when repairing self-intersections), keep only the `(Multi)Polygon` components and discard line / point fragments.
+3. **`buffer(0)` fallback** — the older trick, kept around for rare cases `make_valid()` cannot handle.
+4. **Reject** — if all repair attempts fail, send the feature to the rejected output with its original geometry preserved.
+
+## Robustness handling
+
+- **Missing `.prj`** — script warns clearly and prompts for confirmation before proceeding.
+- **Z and M dimensions** — stripped automatically with a console note (this script is intended for 2D output).
+- **`repaired` field name collision** — if the input already has a `repaired` column, the script picks an alternate name (`was_fixed`, `fixed`, etc.) and tells you which one it used.
+- **DBF encoding** — falls back to CP1252 if the default UTF-8 read fails (handles older shapefiles with non-ASCII attribute values).
+- **Mixed singlepart / multipart output** — all output geometries are normalized to `Multi*` before writing, sidestepping pyogrio / fiona quirks. ESRI shapefile format doesn't distinguish single vs. multi at the format level, so re-reading the output returns `Polygon` / `MultiPolygon` exactly as expected.
+
+## Tips for using the output
+
+- **Inspect repaired features in QGIS / ArcGIS** by filtering `"repaired" = 1` (or `'true'` depending on driver) on the valid output. Categorical symbology on the same field also works.
+- **Trace a rejected feature back to its origin** by opening the CSV report and matching on `row_idx` or your chosen identifier column.
+- **Re-running the script** silently overwrites previous outputs in `cleaned/`.
+
+## Requirements
+
+- Python 3.9+
+- [`geopandas`](https://geopandas.org/) >= 0.13
+- [`shapely`](https://shapely.readthedocs.io/) >= 2.0
+
+See [`requirements.txt`](requirements.txt) for the exact constraints.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Author
+
+Matt Bromley, Desert Research Institute

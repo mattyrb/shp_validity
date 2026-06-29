@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Output produced by shp_validity.py when run inside the repo (and inside
+# sample_data/ when you try the demo). Regenerated on every run.
+cleaned/
+
+# Local test data. The committed demo lives in sample_data/ and is kept.
+test_data/
+*.shp.local
+
+# Common GIS sid

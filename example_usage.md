@@ -140,6 +140,34 @@ The same field works for categorical symbology
 (Properties → Symbology → Categorized → `repaired`) so repaired features
 stand out against features that were already valid.
 
+## Sliver and overlap checks
+
+Two optional prompts target artifacts that distort zonal area:
+
+```
+Flag thin 'sliver' polygons (artifacts of prior overlays)? [y/N]: y
+  Maximum sliver width in CRS units (mean width = 2*area/perimeter) [5.0]: 5
+Check for overlapping polygons (they double-count area)? [y/N]: y
+  Minimum overlap area to flag in CRS units squared (0 = any overlap) [0.0]: 0
+```
+
+With these on, the run adds `width`, `thinness`, and `sliver` (and `ov_area`,
+`ov_n`) columns to the report, and the summary ends with counts:
+
+```
+  Thin sliver features flagged: 1 (mean width < 5.0 metre)
+  Features with overlaps:       2
+  Total overlap area:           5,000.00 metre^2
+```
+
+It also writes `<name>_slivers.shp` (the flagged thin features),
+`<name>_overlaps.csv` (the overlapping pairs and their area), and
+`<name>_overlap_zones.shp` (the overlap polygons themselves, for map review).
+The width metric flags a 2 m wide artifact while leaving a legitimately long,
+40 m wide field alone, so length by itself never triggers a false positive.
+Run on a geographic (degree) layer, the script warns first that area, width,
+and overlap values will not be meaningful.
+
 ## Re-running
 
 Re-running the script silently overwrites the contents of `cleaned/`.

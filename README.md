@@ -19,6 +19,9 @@ more shapefiles, pick the one to clean, and it produces a tidy
 - Drops non-polygon geometries (points, lines, etc.) and routes them to a separate rejected file.
 - Extracts polygon parts from any `GeometryCollection` produced during repair.
 - Optionally adds a boolean `repaired` field to the valid output so you can filter / symbolize repaired features in QGIS or ArcGIS. Decline the prompt to keep the output attributes identical to the input (repair status is still recorded in the CSV report).
+- Flags thin "sliver" polygons by characteristic width (`2 * area / perimeter`), catching overlay artifacts that are thin but still cover real area, while leaving legitimately long, wide fields alone. Writes a separate slivers file for review.
+- Flags overlapping polygons (which double-count ET and applied water), with per-feature overlap area, a pair list, and the overlap geometries as a layer you can open on a map.
+- Warns when the layer is in a geographic CRS (degrees), since area, sliver width, and overlap area are then not meaningful for water calculations, and logs the CRS in the run summary.
 - Per-feature CSV audit log includes a user-selected identifier column for cross-reference.
 - Robustness handling for missing CRS, Z/M dimensions, field-name collisions, encoding issues, and mixed singlepart/multipart output.
 
@@ -56,14 +59,15 @@ The script will:
 
 1. List the `.shp` files in the current working directory and ask which one to clean.
 2. Ask whether to write the CSV audit report.
-3. Ask whether to add a `repaired` flag field to the valid output (decline to keep the output attributes identical to the input).
-4. Warn you if the input has no `.prj` (missing CRS) and ask whether to proceed.
-5. Strip any Z / M dimensions automatically (with a note).
-6. Show the input's attribute columns and ask which one to use as a feature identifier in the CSV report.
-7. Run the validation and repair pipeline.
-8. Print a summary of what happened to each feature.
+3. Ask whether to add flag fields (`repaired`, plus `sliver` and overlap fields when those checks are on). Decline to keep the output attributes identical to the input.
+4. Ask whether to flag thin sliver polygons, and if so the maximum sliver width in CRS units.
+5. Ask whether to check for overlapping polygons, and if so the minimum overlap area to flag.
+6. Warn you if the input has no `.prj`, or if the CRS is geographic, and ask whether to proceed.
+7. Strip any Z / M dimensions automatically (with a note).
+8. Show the input's attribute columns and ask which one to use as a feature identifier in the CSV report.
+9. Run the pipeline and print a summary, including the CRS and any sliver / overlap counts.
 
-If you add the flag and your input already has a `repaired` column, the script picks a non-conflicting name (`was_fixed`, etc.) and tells you which it used.
+If you add flag fields and your input already has a column of that name, the script picks a non-conflicting name (`was_fixed`, `is_sliver`, etc.) and tells you which it used.
 
 See [example_usage.md](example_usage.md) for a full walkthrough with
 sample console output.
@@ -78,11 +82,16 @@ All outputs land in a `cleaned/` subdirectory next to the input shapefile:
 | `<name>_rejected_poly.shp` | Polygons that could not be repaired (only created if any exist). |
 | `<name>_rejected_line.shp` | Filtered `(Multi)LineString` features (only created if any exist). |
 | `<name>_rejected_point.shp` | Filtered `(Multi)Point` features (only created if any exist). |
+| `<name>_slivers.shp` | Thin sliver features flagged for review (only when sliver flagging is on and any are found). |
+| `<name>_overlaps.csv` | Overlapping feature pairs with their overlap area (only when overlap checking is on). |
+| `<name>_overlap_zones.shp` | The overlap geometries themselves, for map review (only when overlap checking is on). |
 | `<name>_report.csv` | Per-feature audit log — the place to look up exactly why a feature ended up where it did. |
 
 The CSV report contains one row per input feature with the columns:
 `row_idx`, `<your_id_field>` (if you picked one), `original_type`,
-`was_valid`, `status`, `repaired`, and `validity_msg`.
+`was_valid`, `status`, `repaired`, then `width`, `thinness`, `sliver` (when
+sliver flagging is on) and `ov_area`, `ov_n` (when overlap checking is on),
+and finally `validity_msg`.
 
 The `status` column uses these descriptive tags:
 
@@ -96,6 +105,33 @@ The `status` column uses these descriptive tags:
 | `null_geom` | Geometry was null / NaN. |
 | `empty_geom` | Geometry was empty (no coordinates). |
 | `wrong_type_point` etc. | Original geometry was not a polygon (point, line, etc.). |
+
+## Quality checks for ET and applied-water work
+
+These optional checks target problems that distort zonal area, and therefore
+distort evapotranspiration and applied-water totals.
+
+**CRS check.** ET depth times area, and applied-water volumes, are only
+meaningful in a projected CRS. If the layer is geographic (degrees) the script
+warns, and if you have area-based checks on it asks before continuing. The CRS
+and its units are logged in the run summary.
+
+**Sliver flagging.** Overlay operations leave thin sliver polygons that can
+still cover a meaningful area, so an area threshold alone does not find them.
+The script flags features by characteristic width, `2 * area / perimeter`,
+which approaches the true width of an elongated shape regardless of its length.
+A long but legitimately wide field is not flagged, while a 2 m wide artifact is,
+even when both have similar area. A Polsby-Popper thinness ratio
+(`4 * pi * area / perimeter**2`) is reported alongside so you can apply your own
+cutoff. Flagged features are written to `<name>_slivers.shp` for review.
+
+**Overlap flagging.** Overlapping polygons double-count ET and applied water.
+The script finds overlaps with a spatial index, records each feature's total
+overlap area and neighbor count, writes the overlapping pairs to
+`<name>_overlaps.csv`, and writes the overlap geometries to
+`<name>_overlap_zones.shp` so you can see exactly where they are on a map. This
+flags overlaps for review; it does not resolve them, so you decide how to assign
+or erase the shared area.
 
 ## Repair pipeline
 

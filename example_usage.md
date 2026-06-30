@@ -168,6 +168,24 @@ The width metric flags a 2 m wide artifact while leaving a legitimately long,
 Run on a geographic (degree) layer, the script warns first that area, width,
 and overlap values will not be meaningful.
 
+## Cleaning multipart parts
+
+If your data has multipart polygons where one part is good and another is a
+couple of orphaned vertices, answer yes to the part-cleanup prompt:
+
+```
+Clean degenerate / sliver parts out of multipart polygons? [y/N]: y
+  Minimum part area to keep in CRS units squared
+  (0 = drop only near-zero-area orphan parts) [0.0]: 0
+```
+
+The script explodes each multipart, repairs each part, drops the junk, and
+reassembles the survivors. The removed parts are written to
+`<name>_removed_parts.shp` (with the parent row index and area) so you can
+confirm what was erased, and the report gains `parts_drop` and `drop_area`
+columns. Set a `min_part_area` above 0 to also drop small-but-real sliver
+parts; a feature whose parts are all dropped is sent to the rejected output.
+
 ## Re-running
 
 Re-running the script silently overwrites the contents of `cleaned/`.

@@ -22,6 +22,7 @@ more shapefiles, pick the one to clean, and it produces a tidy
 - Flags thin "sliver" polygons by characteristic width (`2 * area / perimeter`), catching overlay artifacts that are thin but still cover real area, while leaving legitimately long, wide fields alone. Writes a separate slivers file for review.
 - Flags overlapping polygons (which double-count ET and applied water), with per-feature overlap area, a pair list, and the overlap geometries as a layer you can open on a map.
 - Warns when the layer is in a geographic CRS (degrees), since area, sliver width, and overlap area are then not meaningful for water calculations, and logs the CRS in the run summary.
+- Cleans degenerate / sliver parts out of multipart polygons (the classic "one good part plus a couple of orphaned vertices" artifact): explodes each multipart, repairs each part, drops the junk, reassembles, and writes the removed parts to a side file for review.
 - Per-feature CSV audit log includes a user-selected identifier column for cross-reference.
 - Robustness handling for missing CRS, Z/M dimensions, field-name collisions, encoding issues, and mixed singlepart/multipart output.
 
@@ -62,10 +63,11 @@ The script will:
 3. Ask whether to add flag fields (`repaired`, plus `sliver` and overlap fields when those checks are on). Decline to keep the output attributes identical to the input.
 4. Ask whether to flag thin sliver polygons, and if so the maximum sliver width in CRS units.
 5. Ask whether to check for overlapping polygons, and if so the minimum overlap area to flag.
-6. Warn you if the input has no `.prj`, or if the CRS is geographic, and ask whether to proceed.
-7. Strip any Z / M dimensions automatically (with a note).
-8. Show the input's attribute columns and ask which one to use as a feature identifier in the CSV report.
-9. Run the pipeline and print a summary, including the CRS and any sliver / overlap counts.
+6. Ask whether to clean degenerate / sliver parts out of multipart polygons, and if so the minimum part area to keep.
+7. Warn you if the input has no `.prj`, or if the CRS is geographic, and ask whether to proceed.
+8. Strip any Z / M dimensions automatically (with a note).
+9. Show the input's attribute columns and ask which one to use as a feature identifier in the CSV report.
+10. Run the pipeline and print a summary, including the CRS and any sliver / overlap / part-cleanup counts.
 
 If you add flag fields and your input already has a column of that name, the script picks a non-conflicting name (`was_fixed`, `is_sliver`, etc.) and tells you which it used.
 
@@ -85,13 +87,14 @@ All outputs land in a `cleaned/` subdirectory next to the input shapefile:
 | `<name>_slivers.shp` | Thin sliver features flagged for review (only when sliver flagging is on and any are found). |
 | `<name>_overlaps.csv` | Overlapping feature pairs with their overlap area (only when overlap checking is on). |
 | `<name>_overlap_zones.shp` | The overlap geometries themselves, for map review (only when overlap checking is on). |
+| `<name>_removed_parts.shp` | Degenerate / sliver parts removed from multipart features, with the parent row index and part area (only when part cleanup is on and any are removed). |
 | `<name>_report.csv` | Per-feature audit log — the place to look up exactly why a feature ended up where it did. |
 
 The CSV report contains one row per input feature with the columns:
 `row_idx`, `<your_id_field>` (if you picked one), `original_type`,
-`was_valid`, `status`, `repaired`, then `width`, `thinness`, `sliver` (when
-sliver flagging is on) and `ov_area`, `ov_n` (when overlap checking is on),
-and finally `validity_msg`.
+`was_valid`, `status`, `repaired`, then `parts_drop`, `drop_area` (when part
+cleanup is on), `width`, `thinness`, `sliver` (when sliver flagging is on),
+`ov_area`, `ov_n` (when overlap checking is on), and finally `validity_msg`.
 
 The `status` column uses these descriptive tags:
 
@@ -132,6 +135,18 @@ overlap area and neighbor count, writes the overlapping pairs to
 `<name>_overlap_zones.shp` so you can see exactly where they are on a map. This
 flags overlaps for review; it does not resolve them, so you decide how to assign
 or erase the shared area.
+
+**Multipart part cleanup.** A multipart polygon can carry a perfectly good part
+alongside a degenerate one, such as a couple of orphaned vertices left by an
+earlier overlay. When the bad part is invalid it usually makes the whole feature
+invalid, and the repair step above already drops it. When the bad part is a tiny
+but technically valid sliver, the whole feature reads as valid and slips through
+untouched. Part cleanup handles both: it explodes each multipart, repairs each
+part on its own, drops any part that will not repair to a valid polygon or that
+falls below the degenerate-area floor (or your `min_part_area`), then reassembles
+the survivors. Removed parts are written to `<name>_removed_parts.shp` with their
+parent feature index and area, so you can confirm what was erased. This automates
+the manual explode / find-sliver / erase workflow.
 
 ## Repair pipeline
 

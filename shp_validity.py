@@ -404,6 +404,73 @@ def find_overlaps(gdf, min_area: float = 0.0):
     return overlap_area, overlap_count, pairs
 
 
+# Parts smaller than this (CRS units squared) are treated as degenerate
+# "orphaned vertex" debris and dropped regardless of the user threshold.
+DEGENERATE_AREA_EPS = 1e-6
+
+
+def explode_polygons(geom):
+    """Return a flat list of Polygon parts from any polygonal geometry."""
+    if not _is_geometry(geom) or geom.is_empty:
+        return []
+    if isinstance(geom, Polygon):
+        return [geom]
+    if isinstance(geom, MultiPolygon):
+        return [g for g in geom.geoms if not g.is_empty]
+    if isinstance(geom, GeometryCollection):
+        out = []
+        for g in geom.geoms:
+            out.extend(explode_polygons(g))
+        return out
+    return []
+
+
+def clean_multipart_parts(geom, min_part_area: float = 0.0):
+    """Explode a (multi)polygon, repair each part, and drop degenerate or
+    undersized parts. Returns ``(cleaned_geom_or_None, dropped)`` where
+    dropped is a list of ``(part_geom, area)`` for each removed part.
+
+    A part is dropped if it cannot be repaired to a valid polygon (the
+    "couple of orphaned vertices" case), or if its area is below the
+    degenerate epsilon or the user's ``min_part_area``. Surviving parts are
+    reassembled into a Polygon (one part) or MultiPolygon (several). This
+    automates the manual explode / identify-sliver / erase workflow.
+    """
+    parts = explode_polygons(geom)
+    if not parts:
+        return None, []
+
+    threshold = max(DEGENERATE_AREA_EPS, float(min_part_area))
+    keep = []
+    dropped = []
+    for part in parts:
+        repaired = part
+        if not part.is_valid:
+            try:
+                repaired = extract_polygons(make_valid(part))
+            except Exception:
+                repaired = None
+        if repaired is None or repaired.is_empty:
+            dropped.append((part, float(part.area)))
+            continue
+        if repaired.area < threshold:
+            dropped.append((repaired, float(repaired.area)))
+            continue
+        keep.append(repaired)
+
+    if not keep:
+        return None, dropped
+
+    flat = []
+    for k in keep:
+        if isinstance(k, MultiPolygon):
+            flat.extend(k.geoms)
+        else:
+            flat.append(k)
+    cleaned = flat[0] if len(flat) == 1 else MultiPolygon(flat)
+    return cleaned, dropped
+
+
 # ---------------------------------------------------------------------------
 # Output writing
 # ---------------------------------------------------------------------------
@@ -448,7 +515,8 @@ def write_rejected_files(rejected_records, cleaned_dir: Path, base: str, crs):
 def process_shapefile(shp_path: Path, write_report: bool = True,
                       add_repaired_field: bool = True,
                       flag_slivers: bool = False, sliver_width: float = 0.0,
-                      flag_overlaps: bool = False, min_overlap_area: float = 0.0):
+                      flag_overlaps: bool = False, min_overlap_area: float = 0.0,
+                      clean_parts: bool = False, min_part_area: float = 0.0):
     """Run the full validate / repair / write pipeline on one shapefile.
 
     If ``add_repaired_field`` is False, the valid output keeps the input
@@ -504,11 +572,15 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
     sliver_field = None
     ov_area_field = None
     ov_n_field = None
+    parts_drop_field = None
     if add_repaired_field:
         repaired_field = pick_unique_field_name(gdf, "repaired")
         if repaired_field != "repaired":
             print(f"  Note: input already has a 'repaired' column; "
                   f"using '{repaired_field}' for the repair flag instead.")
+        if clean_parts:
+            parts_drop_field = pick_unique_field_name(
+                gdf, "parts_drop", ["pts_drop", "ndropped"])
         if flag_slivers:
             sliver_field = pick_unique_field_name(
                 gdf, "sliver", ["is_sliver", "sliver_flg", "slivr"])
@@ -524,6 +596,10 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
     valid_rows = []
     rejected_records = []
     sliver_rows = []
+    removed_part_geoms = []
+    removed_part_attrs = []
+    n_part_features = 0
+    dropped_area_total = 0.0
     report_rows = []
     report_by_idx = {}
 
@@ -543,6 +619,25 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
         repaired_geom, status = repair_geometry(geom)
         was_repaired = status in REPAIRED_STATUSES
 
+        # --- Clean degenerate / sliver parts out of multiparts -------------
+        parts_dropped = 0
+        part_drop_area = 0.0
+        if clean_parts and repaired_geom is not None:
+            cleaned, dropped = clean_multipart_parts(repaired_geom, min_part_area)
+            if dropped:
+                parts_dropped = len(dropped)
+                part_drop_area = sum(a for _g, a in dropped)
+                for dg, da in dropped:
+                    removed_part_geoms.append(_to_multipart(dg))
+                    removed_part_attrs.append(
+                        {"parent_idx": row_idx, "part_area": round(da, 6)})
+                was_repaired = True
+                n_part_features += 1
+                dropped_area_total += part_drop_area
+            repaired_geom = cleaned
+            if repaired_geom is None:
+                status = "parts_all_dropped"
+
         report_row = {"row_idx": row_idx}
         if id_field is not None:
             report_row[id_field] = row[id_field]
@@ -550,6 +645,9 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
         report_row["was_valid"] = was_valid
         report_row["status"] = status
         report_row["repaired"] = was_repaired
+        if clean_parts:
+            report_row["parts_drop"] = parts_dropped
+            report_row["drop_area"] = round(part_drop_area, 4)
 
         # --- Sliver metrics on the output geometry -------------------------
         sliver_flag = False
@@ -581,6 +679,8 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
                 new_row[repaired_field] = was_repaired
             if add_repaired_field and sliver_field is not None:
                 new_row[sliver_field] = sliver_flag
+            if add_repaired_field and parts_drop_field is not None:
+                new_row[parts_drop_field] = parts_dropped
             valid_rows.append(new_row)
             if flag_slivers and sliver_flag:
                 srow = row.copy()
@@ -652,6 +752,16 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
         print(f"  Wrote {len(sliver_gdf):,} thin sliver feature(s) for review:")
         print(f"    {sliver_path.name}")
 
+    # --- Removed multipart parts ------------------------------------------
+    if clean_parts and removed_part_geoms:
+        removed_gdf = gpd.GeoDataFrame(
+            removed_part_attrs, geometry=removed_part_geoms, crs=gdf.crs)
+        removed_path = cleaned_dir / f"{base}_removed_parts.shp"
+        removed_gdf.to_file(removed_path)
+        print(f"  Removed {len(removed_gdf):,} degenerate/sliver part(s) "
+              f"from {n_part_features:,} multipart feature(s):")
+        print(f"    {removed_path.name}")
+
     # --- Overlap output ----------------------------------------------------
     if flag_overlaps and overlap_pairs:
         id_lookup = gdf[id_field].to_dict() if id_field is not None else None
@@ -697,6 +807,8 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
         if id_field is not None:
             fieldnames.append(id_field)
         fieldnames += ["original_type", "was_valid", "status", "repaired"]
+        if clean_parts:
+            fieldnames += ["parts_drop", "drop_area"]
         if flag_slivers:
             fieldnames += ["width", "thinness", "sliver"]
         if flag_overlaps:
@@ -719,6 +831,8 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
         "sliver_width": sliver_width if flag_slivers else None,
         "n_overlapping": n_overlapping,
         "total_overlap_area": total_overlap_area,
+        "n_part_features": n_part_features if clean_parts else None,
+        "dropped_area_total": dropped_area_total,
     }
     return report_rows, meta
 
@@ -753,6 +867,9 @@ def print_summary(report_rows, meta=None):
             print(f"  Features with overlaps:       {meta['n_overlapping']:,}")
             print(f"  Total overlap area:           "
                   f"{meta.get('total_overlap_area', 0):,.2f} {units}^2")
+        if meta.get("n_part_features") is not None:
+            print(f"  Multipart features cleaned:   {meta['n_part_features']:,} "
+                  f"(area removed: {meta.get('dropped_area_total', 0):,.4f} {units}^2)")
     print()
 
 
@@ -790,6 +907,15 @@ def main():
             "  Minimum overlap area to flag in CRS units squared (0 = any overlap)",
             default=0.0)
 
+    clean_parts = prompt_yes_no(
+        "Clean degenerate / sliver parts out of multipart polygons?", default=False)
+    min_part_area = 0.0
+    if clean_parts:
+        min_part_area = prompt_float(
+            "  Minimum part area to keep in CRS units squared\n"
+            "  (0 = drop only near-zero-area orphan parts)",
+            default=0.0)
+
     report_rows, meta = process_shapefile(
         chosen,
         write_report=write_report,
@@ -798,6 +924,8 @@ def main():
         sliver_width=sliver_width,
         flag_overlaps=flag_overlaps,
         min_overlap_area=min_overlap_area,
+        clean_parts=clean_parts,
+        min_part_area=min_part_area,
     )
     print_summary(report_rows, meta)
 

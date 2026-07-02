@@ -186,6 +186,40 @@ confirm what was erased, and the report gains `parts_drop` and `drop_area`
 columns. Set a `min_part_area` above 0 to also drop small-but-real sliver
 parts; a feature whose parts are all dropped is sent to the rejected output.
 
+## Bulk mode: fixing a directory in place
+
+To repair a whole folder of shapefiles in one pass, overwriting the originals:
+
+```bash
+python shp_validity.py --batch /data/fields --in-place
+```
+
+Each file is validated, repaired, and (by default) run through multipart part
+cleanup, then written back over the original. The originals are copied to a
+timestamped `_backup_...` folder first, dropped features and per-file reports
+go to a `_review/` folder, and the run ends with a batch summary:
+
+```
+============================================================
+BATCH SUMMARY
+============================================================
+Files processed:      2
+Total features:       6
+Valid features kept:  5
+Rejected features:    1
+Multipart features cleaned: 1
+
+Originals were overwritten in place.
+  Backups:              /data/fields/_backup_20260702_091726
+  Reports and rejected: /data/fields/_review
+```
+
+Add `--dry-run` to preview the file list without writing, `--yes` to skip the
+overwrite confirmation, `--recursive` to include subfolders, and
+`--flag-fields` if you do want the `repaired` / `sliver` columns added. The
+attribute schema is preserved by default so fixed files stay drop-in
+compatible with existing joins and models.
+
 ## Re-running
 
 Re-running the script silently overwrites the contents of `cleaned/`.

@@ -23,6 +23,7 @@ more shapefiles, pick the one to clean, and it produces a tidy
 - Flags overlapping polygons (which double-count ET and applied water), with per-feature overlap area, a pair list, and the overlap geometries as a layer you can open on a map.
 - Warns when the layer is in a geographic CRS (degrees), since area, sliver width, and overlap area are then not meaningful for water calculations, and logs the CRS in the run summary.
 - Cleans degenerate / sliver parts out of multipart polygons (the classic "one good part plus a couple of orphaned vertices" artifact): explodes each multipart, repairs each part, drops the junk, reassembles, and writes the removed parts to a side file for review.
+- Runs interactively on one shapefile, or non-interactively in bulk over a directory with `--batch`, including a `--in-place` fix that overwrites the originals after backing them up.
 - Per-feature CSV audit log includes a user-selected identifier column for cross-reference.
 - Robustness handling for missing CRS, Z/M dimensions, field-name collisions, encoding issues, and mixed singlepart/multipart output.
 
@@ -73,6 +74,37 @@ If you add flag fields and your input already has a column of that name, the scr
 
 See [example_usage.md](example_usage.md) for a full walkthrough with
 sample console output.
+
+## Command line and bulk mode
+
+Run with no arguments for the interactive single-file mode above. Pass a path
+or `--batch` to run non-interactively:
+
+```bash
+# one file, cleaned output written to a cleaned/ folder
+python shp_validity.py path/to/fields.shp
+
+# every shapefile in a directory, fixed in place (originals backed up first)
+python shp_validity.py --batch path/to/dir --in-place
+
+# preview what a bulk run would touch, without writing anything
+python shp_validity.py --batch path/to/dir --in-place --dry-run
+```
+
+In `--in-place` mode each input shapefile is overwritten with its cleaned,
+valid features. Before overwriting, the originals and all their sidecars are
+copied to a timestamped `_backup_...` folder (use `--no-backup` to skip, or
+`--backup-dir` to choose the location). Features that cannot be made into valid
+polygons are dropped from the fixed file and written, together with the
+per-feature report, to a `_review/` folder, so nothing is lost silently. By
+default the attribute schema is preserved (no flag fields are added) and
+multipart part cleanup runs; use `--flag-fields`, `--no-clean-parts`, or
+`--min-part-area` to change that, and `--yes` to skip the overwrite prompt in
+scripted runs.
+
+Other flags: `--recursive`, `--id-field NAME`, `--no-report`, `--out-dir DIR`,
+`--flag-slivers` / `--sliver-width`, and `--flag-overlaps` / `--min-overlap-area`.
+Run `python shp_validity.py --help` for the full list.
 
 ## Outputs
 

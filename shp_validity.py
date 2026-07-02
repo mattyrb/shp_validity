@@ -72,9 +72,12 @@ Author: written for Matt Bromley (DRI), GIS / remote sensing workflows.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import math
+import shutil
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -516,7 +519,10 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
                       add_repaired_field: bool = True,
                       flag_slivers: bool = False, sliver_width: float = 0.0,
                       flag_overlaps: bool = False, min_overlap_area: float = 0.0,
-                      clean_parts: bool = False, min_part_area: float = 0.0):
+                      clean_parts: bool = False, min_part_area: float = 0.0,
+                      id_field="__prompt__", interactive: bool = True,
+                      out_dir: Path = None, in_place: bool = False,
+                      backup_dir: Path = None):
     """Run the full validate / repair / write pipeline on one shapefile.
 
     If ``add_repaired_field`` is False, the valid output keeps the input
@@ -529,7 +535,9 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
         gdf = read_shapefile_robust(shp_path)
     except Exception as e:
         print(f"  ERROR reading shapefile: {e}")
-        sys.exit(1)
+        if interactive:
+            sys.exit(1)
+        raise
 
     print(f"  Features: {len(gdf):,}")
     print(f"  CRS:      {gdf.crs}")
@@ -548,7 +556,7 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
         print("\n  WARNING: this shapefile has no CRS (the .prj file is")
         print("  missing or unreadable). Output shapefiles will also lack")
         print("  a .prj, and downstream tools may misinterpret coordinates.")
-        if not prompt_yes_no("  Proceed anyway?", default=False):
+        if interactive and not prompt_yes_no("  Proceed anyway?", default=False):
             print("  Aborting.")
             sys.exit(1)
     elif gdf.crs.is_geographic:
@@ -557,8 +565,9 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
         print("  units and are not meaningful for ET or applied-water work.")
         print("  Reproject to a projected CRS (for example UTM) before relying")
         print("  on any area-based output.")
-        if (flag_slivers or flag_overlaps) and not prompt_yes_no(
-                "  Continue with area-based checks anyway?", default=False):
+        if (interactive and (flag_slivers or flag_overlaps)
+                and not prompt_yes_no(
+                    "  Continue with area-based checks anyway?", default=False)):
             print("  Aborting.")
             sys.exit(1)
 
@@ -590,8 +599,14 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
             ov_n_field = pick_unique_field_name(
                 gdf, "ov_n", ["ov_count", "ovlap_n"])
 
-    # Let the user pick an attribute column to use as a feature identifier.
-    id_field = prompt_id_field(gdf)
+    # Determine the feature-identifier column for the report.
+    if id_field == "__prompt__":
+        id_field = prompt_id_field(gdf) if interactive else None
+    elif id_field is not None:
+        if id_field == gdf.geometry.name or id_field not in gdf.columns:
+            print(f"  Note: identifier column '{id_field}' not found; "
+                  "using row index.")
+            id_field = None
 
     valid_rows = []
     rejected_records = []
@@ -691,9 +706,9 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
         else:
             rejected_records.append((row.to_dict(), status, original_type))
 
-    # Output directory lives next to the input shapefile.
-    cleaned_dir = shp_path.parent / "cleaned"
-    cleaned_dir.mkdir(exist_ok=True)
+    # Output directory for reports / rejected / side files.
+    cleaned_dir = out_dir if out_dir is not None else (shp_path.parent / "cleaned")
+    cleaned_dir.mkdir(parents=True, exist_ok=True)
     base = shp_path.stem
 
     n_slivers = len(sliver_rows) if flag_slivers else None
@@ -723,12 +738,24 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
                 valid_gdf[ov_n_field] = [
                     overlap_count.get(i, 0) for i in valid_gdf.index]
 
-        valid_path = cleaned_dir / f"{base}_valid.shp"
-        valid_gdf.to_file(valid_path)
-        print(f"\n  Wrote {len(valid_gdf):,} valid features:")
-        print(f"    {valid_path}")
+        if in_place:
+            if backup_dir is not None:
+                n_bk = backup_shapefile(shp_path, backup_dir)
+                print(f"\n  Backed up original ({n_bk} file(s)) to:")
+                print(f"    {backup_dir}")
+            _overwrite_in_place(valid_gdf, shp_path)
+            print(f"  Fixed in place ({len(valid_gdf):,} valid features): "
+                  f"{shp_path.name}")
+        else:
+            valid_path = cleaned_dir / f"{base}_valid.shp"
+            valid_gdf.to_file(valid_path)
+            print(f"\n  Wrote {len(valid_gdf):,} valid features:")
+            print(f"    {valid_path}")
     else:
-        print("\n  No valid features to write.")
+        if in_place:
+            print("\n  No valid features -- left the original file untouched.")
+        else:
+            print("\n  No valid features to write.")
 
     # --- Rejected output (split by geometry type) --------------------------
     if rejected_records:
@@ -833,6 +860,10 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
         "total_overlap_area": total_overlap_area,
         "n_part_features": n_part_features if clean_parts else None,
         "dropped_area_total": dropped_area_total,
+        "n_valid": len(valid_rows),
+        "n_rejected": len(rejected_records),
+        "base": base,
+        "in_place": in_place,
     }
     return report_rows, meta
 
@@ -873,7 +904,158 @@ def print_summary(report_rows, meta=None):
     print()
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Bulk / in-place processing
+# ---------------------------------------------------------------------------
+
+# Suffixes appended to output shapefiles, so batch mode can skip its own output.
+GENERATED_SUFFIXES = (
+    "_valid", "_rejected_poly", "_rejected_line", "_rejected_point",
+    "_slivers", "_overlap_zones", "_removed_parts",
+)
+# Subdirectories batch mode creates and should never treat as input.
+SKIP_DIRS = {"cleaned", "_review"}
+# Stale sidecars an overwrite would leave behind (spatial indexes, metadata).
+STALE_SIDECARS = (".sbn", ".sbx", ".qix", ".fix", ".shp.xml", ".aih", ".ain")
+
+
+def backup_shapefile(shp_path: Path, backup_dir: Path) -> int:
+    """Copy a shapefile and all its sidecars into ``backup_dir``. Returns the
+    number of files copied."""
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for f in shp_path.parent.glob(shp_path.stem + ".*"):
+        shutil.copy2(f, backup_dir / f.name)
+        n += 1
+    return n
+
+
+def _overwrite_in_place(valid_gdf, shp_path: Path):
+    """Overwrite the original shapefile with the cleaned valid features, then
+    remove stale sidecars (spatial index, metadata) that no longer match."""
+    valid_gdf.to_file(shp_path)
+    for ext in STALE_SIDECARS:
+        stale = (shp_path.parent / (shp_path.name + ".xml")
+                 if ext == ".shp.xml" else shp_path.with_suffix(ext))
+        if stale.exists():
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
+
+def _is_generated(shp_path: Path) -> bool:
+    return any(shp_path.stem.endswith(suf) for suf in GENERATED_SUFFIXES)
+
+
+def list_batch_shapefiles(directory: Path, recursive: bool = False) -> list:
+    """List input shapefiles in a directory, skipping generated output files
+    and the directories this tool creates."""
+    it = directory.rglob("*.shp") if recursive else directory.glob("*.shp")
+    result = []
+    for p in sorted(it):
+        rel_dirs = p.relative_to(directory).parts[:-1]
+        if any(d in SKIP_DIRS or d.startswith("_backup") for d in rel_dirs):
+            continue
+        if _is_generated(p):
+            continue
+        result.append(p)
+    return result
+
+
+def print_batch_summary(directory, metas, errors, in_place, backup_dir, review_dir):
+    print("\n" + "=" * 60)
+    print("BATCH SUMMARY")
+    print("=" * 60)
+    total_feat = sum(m["n_features"] for _, m in metas)
+    total_valid = sum(m["n_valid"] for _, m in metas)
+    total_rej = sum(m["n_rejected"] for _, m in metas)
+    total_parts = sum((m.get("n_part_features") or 0) for _, m in metas)
+    geographic = [p.name for p, m in metas if m.get("crs_kind") == "geographic"]
+    print(f"Files processed:      {len(metas):,}")
+    if errors:
+        print(f"Files with errors:    {len(errors):,}")
+    print(f"Total features:       {total_feat:,}")
+    print(f"Valid features kept:  {total_valid:,}")
+    print(f"Rejected features:    {total_rej:,}")
+    print(f"Multipart features cleaned: {total_parts:,}")
+    if geographic:
+        print(f"\n  WARNING: {len(geographic)} file(s) were in a geographic CRS "
+              "(area-based\n  values are not meaningful): "
+              + ", ".join(geographic[:5])
+              + (" ..." if len(geographic) > 5 else ""))
+    if in_place:
+        print("\nOriginals were overwritten in place.")
+        if backup_dir is not None:
+            print(f"  Backups:              {backup_dir}")
+        if review_dir is not None:
+            print(f"  Reports and rejected: {review_dir}")
+    for p, e in errors:
+        print(f"  ERROR {p.name}: {e}")
+    print()
+
+
+def process_directory(directory: Path, *, recursive=False, in_place=False,
+                      backup=True, backup_dir=None, dry_run=False, yes=False,
+                      **kw):
+    """Process every input shapefile in ``directory``."""
+    directory = Path(directory)
+    if not directory.is_dir():
+        print(f"Not a directory: {directory}")
+        sys.exit(1)
+
+    shps = list_batch_shapefiles(directory, recursive)
+    if not shps:
+        print(f"No shapefiles found in {directory}"
+              + (" (recursive)" if recursive else "") + ".")
+        return
+
+    print(f"Found {len(shps)} shapefile(s) in {directory}"
+          + (" (recursive)" if recursive else "") + ":")
+    for p in shps:
+        print(f"  - {p.relative_to(directory)}")
+
+    if dry_run:
+        mode = "overwrite in place" if in_place else "write cleaned/ outputs for"
+        print(f"\nDry run: no files will be modified. Would {mode} the "
+              f"{len(shps)} file(s) above.")
+        if in_place and backup:
+            print("Originals would be backed up first.")
+        return
+
+    resolved_backup = None
+    review_dir = None
+    if in_place:
+        review_dir = directory / "_review"
+        if backup:
+            resolved_backup = (Path(backup_dir) if backup_dir is not None
+                               else directory / f"_backup_{time.strftime('%Y%m%d_%H%M%S')}")
+
+    if in_place and not yes:
+        msg = f"\nAbout to OVERWRITE {len(shps)} shapefile(s) in place"
+        if resolved_backup is not None:
+            msg += f" (originals backed up to {resolved_backup.name})"
+        if not prompt_yes_no(msg + ". Continue?", default=False):
+            print("Aborting; no files changed.")
+            return
+
+    metas, errors = [], []
+    for p in shps:
+        try:
+            _, meta = process_shapefile(
+                p, interactive=False, in_place=in_place,
+                out_dir=(review_dir if in_place else None),
+                backup_dir=resolved_backup, **kw)
+            metas.append((p, meta))
+        except Exception as e:  # keep going on a bad file
+            print(f"  ERROR processing {p.name}: {e}")
+            errors.append((p, str(e)))
+
+    print_batch_summary(directory, metas, errors, in_place,
+                        resolved_backup, review_dir)
+
+
+def _run_interactive():
     cwd = Path.cwd()
     print(f"Working directory: {cwd}")
 
@@ -927,6 +1109,99 @@ def main():
         clean_parts=clean_parts,
         min_part_area=min_part_area,
     )
+    print_summary(report_rows, meta)
+
+
+def _build_arg_parser():
+    p = argparse.ArgumentParser(
+        description="Validate, repair, and clean shapefile polygon geometries. "
+                    "Run with no arguments for the interactive single-file mode.")
+    p.add_argument("path", nargs="?",
+                   help="A .shp file to process non-interactively. Omit "
+                        "(and omit --batch) for interactive mode.")
+    p.add_argument("--batch", metavar="DIR",
+                   help="Process every top-level .shp in DIR non-interactively.")
+    p.add_argument("--recursive", action="store_true",
+                   help="With --batch, also recurse into subdirectories.")
+    p.add_argument("--in-place", action="store_true",
+                   help="Overwrite each input with its cleaned valid output "
+                        "(originals are backed up first unless --no-backup).")
+    p.add_argument("--no-backup", action="store_true",
+                   help="Do not back up originals before overwriting (dangerous).")
+    p.add_argument("--backup-dir", metavar="DIR",
+                   help="Directory to hold backups of the originals.")
+    p.add_argument("--out-dir", metavar="DIR",
+                   help="Directory for cleaned/report outputs when not in place.")
+    p.add_argument("--id-field", metavar="NAME",
+                   help="Attribute column to use as the identifier in reports.")
+    p.add_argument("--no-report", action="store_true",
+                   help="Do not write the per-feature CSV audit report.")
+    p.add_argument("--flag-fields", action="store_true",
+                   help="Add repaired/sliver/overlap flag fields to the output "
+                        "(off by default in batch to preserve the schema).")
+    p.add_argument("--no-clean-parts", action="store_true",
+                   help="Disable multipart part cleanup (on by default in batch).")
+    p.add_argument("--min-part-area", type=float, default=0.0,
+                   help="Minimum multipart part area to keep, CRS units squared.")
+    p.add_argument("--flag-slivers", action="store_true",
+                   help="Flag thin sliver features (sidecar report only).")
+    p.add_argument("--sliver-width", type=float, default=5.0,
+                   help="Maximum sliver width in CRS units (default 5).")
+    p.add_argument("--flag-overlaps", action="store_true",
+                   help="Check for overlapping polygons (sidecar report only).")
+    p.add_argument("--min-overlap-area", type=float, default=0.0,
+                   help="Minimum overlap area to flag, CRS units squared.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="With --batch, list what would happen without writing.")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="Skip the in-place overwrite confirmation prompt.")
+    return p
+
+
+def main():
+    args = _build_arg_parser().parse_args()
+
+    # No target given -> classic interactive mode.
+    if not args.batch and not args.path:
+        _run_interactive()
+        return
+
+    common = dict(
+        write_report=not args.no_report,
+        add_repaired_field=args.flag_fields,
+        flag_slivers=args.flag_slivers,
+        sliver_width=args.sliver_width,
+        flag_overlaps=args.flag_overlaps,
+        min_overlap_area=args.min_overlap_area,
+        clean_parts=not args.no_clean_parts,
+        min_part_area=args.min_part_area,
+        id_field=args.id_field if args.id_field else None,
+    )
+
+    if args.batch:
+        process_directory(
+            Path(args.batch), recursive=args.recursive, in_place=args.in_place,
+            backup=not args.no_backup, backup_dir=args.backup_dir,
+            dry_run=args.dry_run, yes=args.yes, **common)
+        return
+
+    # Single file, non-interactive.
+    shp = Path(args.path)
+    if not shp.exists():
+        print(f"File not found: {shp}")
+        sys.exit(1)
+    backup_dir = None
+    if args.in_place and not args.no_backup:
+        backup_dir = (Path(args.backup_dir) if args.backup_dir
+                      else shp.parent / f"_backup_{time.strftime('%Y%m%d_%H%M%S')}")
+    if args.in_place and not args.yes:
+        if not prompt_yes_no(f"Overwrite {shp.name} in place?", default=False):
+            print("Aborting; no files changed.")
+            return
+    report_rows, meta = process_shapefile(
+        shp, interactive=False, in_place=args.in_place,
+        out_dir=(Path(args.out_dir) if args.out_dir else None),
+        backup_dir=backup_dir, **common)
     print_summary(report_rows, meta)
 
 

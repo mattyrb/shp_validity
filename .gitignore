@@ -41,3 +41,9 @@ test_data/
 *.shp.local
 
 # Common GIS sid
+Master_Field_Boundaries.cpg
+Master_Field_Boundaries.dbf
+Master_Field_Boundaries.prj
+Master_Field_Boundaries.shp
+Master_Field_Boundaries.shx
+Master_Field_Boundaries.xml

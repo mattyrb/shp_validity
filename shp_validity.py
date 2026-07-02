@@ -985,7 +985,7 @@ def print_batch_summary(directory, metas, errors, in_place, backup_dir, review_d
               + ", ".join(geographic[:5])
               + (" ..." if len(geographic) > 5 else ""))
     if in_place:
-        print("\nOriginals were overwritten in place.")
+        print("\nOne-shot fix: originals were overwritten in place.")
         if backup_dir is not None:
             print(f"  Backups:              {backup_dir}")
         if review_dir is not None:
@@ -1032,7 +1032,7 @@ def process_directory(directory: Path, *, recursive=False, in_place=False,
                                else directory / f"_backup_{time.strftime('%Y%m%d_%H%M%S')}")
 
     if in_place and not yes:
-        msg = f"\nAbout to OVERWRITE {len(shps)} shapefile(s) in place"
+        msg = f"\nOne-shot fix: about to OVERWRITE {len(shps)} shapefile(s) in place"
         if resolved_backup is not None:
             msg += f" (originals backed up to {resolved_backup.name})"
         if not prompt_yes_no(msg + ". Continue?", default=False):
@@ -1123,9 +1123,11 @@ def _build_arg_parser():
                    help="Process every top-level .shp in DIR non-interactively.")
     p.add_argument("--recursive", action="store_true",
                    help="With --batch, also recurse into subdirectories.")
-    p.add_argument("--in-place", action="store_true",
-                   help="Overwrite each input with its cleaned valid output "
-                        "(originals are backed up first unless --no-backup).")
+    p.add_argument("--one-shot", "--in-place", dest="in_place",
+                   action="store_true",
+                   help="One-shot fix: overwrite each input with its cleaned "
+                        "valid output (originals are backed up first unless "
+                        "--no-backup). --in-place is an accepted alias.")
     p.add_argument("--no-backup", action="store_true",
                    help="Do not back up originals before overwriting (dangerous).")
     p.add_argument("--backup-dir", metavar="DIR",

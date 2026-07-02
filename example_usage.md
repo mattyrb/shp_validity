@@ -186,12 +186,13 @@ confirm what was erased, and the report gains `parts_drop` and `drop_area`
 columns. Set a `min_part_area` above 0 to also drop small-but-real sliver
 parts; a feature whose parts are all dropped is sent to the rejected output.
 
-## Bulk mode: fixing a directory in place
+## One-shot mode: fixing a directory in place
 
-To repair a whole folder of shapefiles in one pass, overwriting the originals:
+The **one-shot** approach repairs a whole folder of shapefiles in one pass,
+overwriting the originals:
 
 ```bash
-python shp_validity.py --batch /data/fields --in-place
+python shp_validity.py --batch /data/fields --one-shot
 ```
 
 Each file is validated, repaired, and (by default) run through multipart part
@@ -209,7 +210,7 @@ Valid features kept:  5
 Rejected features:    1
 Multipart features cleaned: 1
 
-Originals were overwritten in place.
+One-shot fix: originals were overwritten in place.
   Backups:              /data/fields/_backup_20260702_091726
   Reports and rejected: /data/fields/_review
 ```

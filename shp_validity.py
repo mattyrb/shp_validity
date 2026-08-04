@@ -82,6 +82,7 @@ from collections import Counter
 from pathlib import Path
 
 import geopandas as gpd
+import pyogrio
 import shapely
 from shapely.geometry import (
     GeometryCollection,
@@ -114,10 +115,10 @@ def _to_multipart(geom):
     return geom
 
 
-def read_shapefile_robust(shp_path: Path):
-    """Read a shapefile, falling back to CP1252 encoding if the default fails."""
+def read_shapefile_robust(shp_path: Path, **kwargs):
+    """Read a vector file, falling back to CP1252 encoding if the default fails."""
     try:
-        return gpd.read_file(shp_path)
+        return gpd.read_file(shp_path, **kwargs)
     except UnicodeDecodeError:
         pass
     except Exception as e:
@@ -126,7 +127,61 @@ def read_shapefile_robust(shp_path: Path):
             raise
 
     print("  Note: default encoding failed; retrying with CP1252.")
-    return gpd.read_file(shp_path, encoding="cp1252")
+    return gpd.read_file(shp_path, **kwargs, encoding="cp1252")
+
+
+# Vector formats accepted as input.
+VECTOR_EXTS = (".shp", ".gpkg")
+
+
+def is_gpkg(path: Path) -> bool:
+    return path.suffix.lower() == ".gpkg"
+
+
+def gpkg_layers(path: Path) -> list[tuple[str, str]]:
+    """Return [(layer_name, geometry_type), ...] for a GeoPackage."""
+    return [(str(n), str(g)) for n, g in pyogrio.list_layers(path)]
+
+
+def resolve_gpkg_layer(path: Path, layer, interactive: bool) -> str:
+    """Pick the layer to process in a GeoPackage.
+
+    Uses ``layer`` if given (validated), the sole layer if there is only
+    one, an interactive prompt when allowed, and otherwise raises with the
+    available layer names so batch runs fail with a clear message.
+    """
+    layers = gpkg_layers(path)
+    names = [n for n, _g in layers]
+    if layer is not None:
+        if layer in names:
+            return layer
+        if len(names) == 1:
+            # Batch runs pass one --layer for a whole directory; a file
+            # with a single, differently named layer is unambiguous.
+            print(f"  Note: {path.name} has no layer '{layer}'; using its "
+                  f"only layer '{names[0]}'.")
+            return names[0]
+        raise ValueError(
+            f"layer '{layer}' not found in {path.name}; "
+            f"available: {', '.join(names)}")
+    if len(names) == 1:
+        return names[0]
+    if interactive:
+        print(f"\nLayers in {path.name}:")
+        for i, (n, g) in enumerate(layers, 1):
+            print(f"  {i}. {n}  ({g})")
+        while True:
+            choice = input(f"\nSelect a layer [1-{len(names)}]: ").strip()
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(names):
+                    return names[idx]
+            except ValueError:
+                pass
+            print(f"  Please enter a number between 1 and {len(names)}.")
+    raise ValueError(
+        f"{path.name} has {len(names)} layers; specify one with --layer. "
+        f"Available: {', '.join(names)}")
 
 
 def strip_z_dimensions(gdf):
@@ -181,18 +236,21 @@ REPAIRED_STATUSES = {
 # ---------------------------------------------------------------------------
 
 def list_shapefiles(directory: Path) -> list[Path]:
-    """Return a sorted list of .shp files in the given directory."""
-    return sorted(directory.glob("*.shp"))
+    """Return a sorted list of vector files (.shp, .gpkg) in the directory."""
+    files = []
+    for ext in VECTOR_EXTS:
+        files.extend(directory.glob(f"*{ext}"))
+    return sorted(files)
 
 
 def prompt_shapefile_choice(shapefiles: list[Path]) -> Path:
     """Prompt the user to pick a shapefile from the list."""
-    print("\nShapefiles available in this directory:")
+    print("\nVector files available in this directory:")
     for i, shp in enumerate(shapefiles, 1):
         print(f"  {i}. {shp.name}")
 
     while True:
-        choice = input(f"\nSelect a shapefile [1-{len(shapefiles)}]: ").strip()
+        choice = input(f"\nSelect a file [1-{len(shapefiles)}]: ").strip()
         try:
             idx = int(choice) - 1
             if 0 <= idx < len(shapefiles):
@@ -489,8 +547,23 @@ def _bucket_for_geom_type(geom_type: str) -> str | None:
     return None
 
 
-def write_rejected_files(rejected_records, cleaned_dir: Path, base: str, crs):
-    """Split rejected features by geometry type and write each as its own .shp."""
+def write_output(gdf, cleaned_dir: Path, base: str, tag: str,
+                 out_gpkg: Path = None, layer: str = None):
+    """Write a side output as a shapefile, or as a layer in the companion
+    GeoPackage when the input was a .gpkg. Returns a printable name."""
+    if out_gpkg is not None:
+        lname = f"{layer}_{tag}"
+        mode = "a" if out_gpkg.exists() else "w"
+        gdf.to_file(out_gpkg, layer=lname, driver="GPKG", mode=mode)
+        return f"{out_gpkg.name}:{lname}"
+    out_path = cleaned_dir / f"{base}_{tag}.shp"
+    gdf.to_file(out_path)
+    return out_path.name
+
+
+def write_rejected_files(rejected_records, cleaned_dir: Path, base: str, crs,
+                         out_gpkg: Path = None, layer: str = None):
+    """Split rejected features by geometry type and write each bucket."""
     buckets: dict[str, list] = {"poly": [], "line": [], "point": []}
 
     for rec, status, geom_type in rejected_records:
@@ -505,9 +578,9 @@ def write_rejected_files(rejected_records, cleaned_dir: Path, base: str, crs):
             continue
         gdf = gpd.GeoDataFrame(rows, crs=crs)
         gdf["geometry"] = gdf.geometry.apply(_to_multipart)
-        out_path = cleaned_dir / f"{base}_rejected_{bucket}.shp"
-        gdf.to_file(out_path)
-        written.append((out_path, len(gdf)))
+        name = write_output(gdf, cleaned_dir, base, f"rejected_{bucket}",
+                            out_gpkg, layer)
+        written.append((name, len(gdf)))
     return written
 
 
@@ -522,7 +595,7 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
                       clean_parts: bool = False, min_part_area: float = 0.0,
                       id_field="__prompt__", interactive: bool = True,
                       out_dir: Path = None, in_place: bool = False,
-                      backup_dir: Path = None):
+                      backup_dir: Path = None, layer: str = None):
     """Run the full validate / repair / write pipeline on one shapefile.
 
     If ``add_repaired_field`` is False, the valid output keeps the input
@@ -530,9 +603,16 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
     sliver, and overlap information is still recorded in the CSV report and
     the side files, so nothing is lost; it just lives outside the shapefile.
     """
-    print(f"\nReading: {shp_path.name}")
+    if is_gpkg(shp_path):
+        layer = resolve_gpkg_layer(shp_path, layer, interactive)
+    else:
+        layer = None
+
+    src_label = shp_path.name if layer is None else f"{shp_path.name}:{layer}"
+    print(f"\nReading: {src_label}")
     try:
-        gdf = read_shapefile_robust(shp_path)
+        gdf = read_shapefile_robust(
+            shp_path, **({"layer": layer} if layer else {}))
     except Exception as e:
         print(f"  ERROR reading shapefile: {e}")
         if interactive:
@@ -709,7 +789,15 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
     # Output directory for reports / rejected / side files.
     cleaned_dir = out_dir if out_dir is not None else (shp_path.parent / "cleaned")
     cleaned_dir.mkdir(parents=True, exist_ok=True)
-    base = shp_path.stem
+    base = shp_path.stem if layer is None else f"{shp_path.stem}_{layer}"
+
+    # For GeoPackage input, side outputs go into a companion GeoPackage as
+    # layers instead of loose shapefiles (no 10-char field-name limits).
+    out_gpkg = None
+    if layer is not None:
+        out_gpkg = cleaned_dir / f"{shp_path.stem}_cleaned.gpkg"
+        if out_gpkg.exists():
+            out_gpkg.unlink()  # fresh run, like re-writing cleaned/
 
     n_slivers = len(sliver_rows) if flag_slivers else None
     n_overlapping = None
@@ -743,14 +831,14 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
                 n_bk = backup_shapefile(shp_path, backup_dir)
                 print(f"\n  Backed up original ({n_bk} file(s)) to:")
                 print(f"    {backup_dir}")
-            _overwrite_in_place(valid_gdf, shp_path)
+            _overwrite_in_place(valid_gdf, shp_path, layer)
             print(f"  Fixed in place ({len(valid_gdf):,} valid features): "
-                  f"{shp_path.name}")
+                  f"{src_label}")
         else:
-            valid_path = cleaned_dir / f"{base}_valid.shp"
-            valid_gdf.to_file(valid_path)
+            name = write_output(valid_gdf, cleaned_dir, base, "valid",
+                                out_gpkg, layer)
             print(f"\n  Wrote {len(valid_gdf):,} valid features:")
-            print(f"    {valid_path}")
+            print(f"    {cleaned_dir / name if out_gpkg is None else name}")
     else:
         if in_place:
             print("\n  No valid features -- left the original file untouched.")
@@ -759,11 +847,12 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
 
     # --- Rejected output (split by geometry type) --------------------------
     if rejected_records:
-        written = write_rejected_files(rejected_records, cleaned_dir, base, gdf.crs)
+        written = write_rejected_files(rejected_records, cleaned_dir, base,
+                                       gdf.crs, out_gpkg, layer)
         if written:
             print(f"  Wrote rejected features to:")
-            for path, n in written:
-                print(f"    {path.name}  ({n:,} features)")
+            for name, n in written:
+                print(f"    {name}  ({n:,} features)")
         spatial_count = sum(n for _, n in written)
         unspatial = len(rejected_records) - spatial_count
         if unspatial:
@@ -774,20 +863,20 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
     if flag_slivers and sliver_rows:
         sliver_gdf = gpd.GeoDataFrame(sliver_rows, crs=gdf.crs)
         sliver_gdf["geometry"] = sliver_gdf.geometry.apply(_to_multipart)
-        sliver_path = cleaned_dir / f"{base}_slivers.shp"
-        sliver_gdf.to_file(sliver_path)
+        name = write_output(sliver_gdf, cleaned_dir, base, "slivers",
+                            out_gpkg, layer)
         print(f"  Wrote {len(sliver_gdf):,} thin sliver feature(s) for review:")
-        print(f"    {sliver_path.name}")
+        print(f"    {name}")
 
     # --- Removed multipart parts ------------------------------------------
     if clean_parts and removed_part_geoms:
         removed_gdf = gpd.GeoDataFrame(
             removed_part_attrs, geometry=removed_part_geoms, crs=gdf.crs)
-        removed_path = cleaned_dir / f"{base}_removed_parts.shp"
-        removed_gdf.to_file(removed_path)
+        name = write_output(removed_gdf, cleaned_dir, base, "removed_parts",
+                            out_gpkg, layer)
         print(f"  Removed {len(removed_gdf):,} degenerate/sliver part(s) "
               f"from {n_part_features:,} multipart feature(s):")
-        print(f"    {removed_path.name}")
+        print(f"    {name}")
 
     # --- Overlap output ----------------------------------------------------
     if flag_overlaps and overlap_pairs:
@@ -823,9 +912,9 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
                                   "ov_area": round(area, 4)})
         if zone_geoms:
             zones = gpd.GeoDataFrame(zone_attr, geometry=zone_geoms, crs=gdf.crs)
-            zone_path = cleaned_dir / f"{base}_overlap_zones.shp"
-            zones.to_file(zone_path)
-            print(f"    {zone_path.name}  ({len(zones):,} overlap zones)")
+            name = write_output(zones, cleaned_dir, base, "overlap_zones",
+                                out_gpkg, layer)
+            print(f"    {name}  ({len(zones):,} overlap zones)")
 
     # --- Audit report ------------------------------------------------------
     if write_report:
@@ -863,6 +952,7 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
         "n_valid": len(valid_rows),
         "n_rejected": len(rejected_records),
         "base": base,
+        "layer": layer,
         "in_place": in_place,
     }
     return report_rows, meta
@@ -930,9 +1020,13 @@ def backup_shapefile(shp_path: Path, backup_dir: Path) -> int:
     return n
 
 
-def _overwrite_in_place(valid_gdf, shp_path: Path):
-    """Overwrite the original shapefile with the cleaned valid features, then
-    remove stale sidecars (spatial index, metadata) that no longer match."""
+def _overwrite_in_place(valid_gdf, shp_path: Path, layer: str = None):
+    """Overwrite the original file with the cleaned valid features. For a
+    GeoPackage this rewrites just the target layer (other layers are kept).
+    For a shapefile, stale sidecars (spatial index, metadata) are removed."""
+    if layer is not None:
+        valid_gdf.to_file(shp_path, layer=layer, driver="GPKG")
+        return
     valid_gdf.to_file(shp_path)
     for ext in STALE_SIDECARS:
         stale = (shp_path.parent / (shp_path.name + ".xml")
@@ -945,13 +1039,18 @@ def _overwrite_in_place(valid_gdf, shp_path: Path):
 
 
 def _is_generated(shp_path: Path) -> bool:
+    if shp_path.stem.endswith("_cleaned") and is_gpkg(shp_path):
+        return True
     return any(shp_path.stem.endswith(suf) for suf in GENERATED_SUFFIXES)
 
 
 def list_batch_shapefiles(directory: Path, recursive: bool = False) -> list:
     """List input shapefiles in a directory, skipping generated output files
     and the directories this tool creates."""
-    it = directory.rglob("*.shp") if recursive else directory.glob("*.shp")
+    it = []
+    for ext in VECTOR_EXTS:
+        it.extend(directory.rglob(f"*{ext}") if recursive
+                  else directory.glob(f"*{ext}"))
     result = []
     for p in sorted(it):
         rel_dirs = p.relative_to(directory).parts[:-1]
@@ -1006,11 +1105,11 @@ def process_directory(directory: Path, *, recursive=False, in_place=False,
 
     shps = list_batch_shapefiles(directory, recursive)
     if not shps:
-        print(f"No shapefiles found in {directory}"
+        print(f"No vector files found in {directory}"
               + (" (recursive)" if recursive else "") + ".")
         return
 
-    print(f"Found {len(shps)} shapefile(s) in {directory}"
+    print(f"Found {len(shps)} vector file(s) in {directory}"
           + (" (recursive)" if recursive else "") + ":")
     for p in shps:
         print(f"  - {p.relative_to(directory)}")
@@ -1032,7 +1131,7 @@ def process_directory(directory: Path, *, recursive=False, in_place=False,
                                else directory / f"_backup_{time.strftime('%Y%m%d_%H%M%S')}")
 
     if in_place and not yes:
-        msg = f"\nOne-shot fix: about to OVERWRITE {len(shps)} shapefile(s) in place"
+        msg = f"\nOne-shot fix: about to OVERWRITE {len(shps)} file(s) in place"
         if resolved_backup is not None:
             msg += f" (originals backed up to {resolved_backup.name})"
         if not prompt_yes_no(msg + ". Continue?", default=False):
@@ -1134,6 +1233,9 @@ def _build_arg_parser():
                    help="Directory to hold backups of the originals.")
     p.add_argument("--out-dir", metavar="DIR",
                    help="Directory for cleaned/report outputs when not in place.")
+    p.add_argument("--layer", metavar="NAME",
+                   help="GeoPackage layer to process (required for a "
+                        "multi-layer .gpkg; ignored for shapefiles).")
     p.add_argument("--id-field", metavar="NAME",
                    help="Attribute column to use as the identifier in reports.")
     p.add_argument("--no-report", action="store_true",
@@ -1178,6 +1280,7 @@ def main():
         clean_parts=not args.no_clean_parts,
         min_part_area=args.min_part_area,
         id_field=args.id_field if args.id_field else None,
+        layer=args.layer,
     )
 
     if args.batch:
@@ -1200,10 +1303,14 @@ def main():
         if not prompt_yes_no(f"Overwrite {shp.name} in place?", default=False):
             print("Aborting; no files changed.")
             return
-    report_rows, meta = process_shapefile(
-        shp, interactive=False, in_place=args.in_place,
-        out_dir=(Path(args.out_dir) if args.out_dir else None),
-        backup_dir=backup_dir, **common)
+    try:
+        report_rows, meta = process_shapefile(
+            shp, interactive=False, in_place=args.in_place,
+            out_dir=(Path(args.out_dir) if args.out_dir else None),
+            backup_dir=backup_dir, **common)
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
     print_summary(report_rows, meta)
 
 

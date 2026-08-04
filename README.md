@@ -1,7 +1,7 @@
 # shp_validity
 
 A Python utility for validating, repairing, and cleaning geometries in
-ESRI shapefiles. Designed for GIS and remote sensing workflows where
+ESRI shapefiles and GeoPackages. Designed for GIS and remote sensing workflows where
 vector products — classification polygons, water masks, field boundaries —
 often arrive with messy topology, mixed geometry types, and the
 occasional null geometry.
@@ -23,7 +23,8 @@ more shapefiles, pick the one to clean, and it produces a tidy
 - Flags overlapping polygons (which double-count ET and applied water), with per-feature overlap area, a pair list, and the overlap geometries as a layer you can open on a map.
 - Warns when the layer is in a geographic CRS (degrees), since area, sliver width, and overlap area are then not meaningful for water calculations, and logs the CRS in the run summary.
 - Cleans degenerate / sliver parts out of multipart polygons (the classic "one good part plus a couple of orphaned vertices" artifact): explodes each multipart, repairs each part, drops the junk, reassembles, and writes the removed parts to a side file for review.
-- Runs interactively on one shapefile, or non-interactively in bulk over a directory with `--batch`, including a one-shot `--one-shot` fix that overwrites the originals after backing them up.
+- Runs interactively on one file, or non-interactively in bulk over a directory with `--batch`, including a one-shot `--one-shot` fix that overwrites the originals after backing them up.
+- Works on GeoPackages (`.gpkg`) as well as shapefiles: pick a layer with `--layer` (or interactively), side outputs go into a companion `<name>_cleaned.gpkg`, and the one-shot fix rewrites just the target layer while preserving the others.
 - Per-feature CSV audit log includes a user-selected identifier column for cross-reference.
 - Robustness handling for missing CRS, Z/M dimensions, field-name collisions, encoding issues, and mixed singlepart/multipart output.
 
@@ -102,6 +103,25 @@ default the attribute schema is preserved (no flag fields are added) and
 multipart part cleanup runs; use `--flag-fields`, `--no-clean-parts`, or
 `--min-part-area` to change that, and `--yes` to skip the overwrite prompt in
 scripted runs.
+
+### GeoPackage input
+
+Pass a `.gpkg` the same way as a shapefile. If the file has one layer it is
+used automatically; for a multi-layer GeoPackage pick the layer interactively
+or name it with `--layer`:
+
+```bash
+python shp_validity.py fields.gpkg --layer field_boundaries
+python shp_validity.py --batch path/to/dir --one-shot   # .shp and .gpkg alike
+```
+
+Side outputs (valid, rejected, slivers, removed parts, overlap zones) are
+written as layers in a companion `<name>_cleaned.gpkg` instead of loose
+shapefiles, which also avoids the 10-character field-name limit. The report
+stays a CSV. In one-shot mode only the target layer is rewritten; all other
+layers in the GeoPackage are preserved, and the whole file is backed up first.
+In batch mode, a single `--layer` name applies where it exists; a file whose
+only layer has a different name is processed anyway with a note.
 
 Other flags: `--recursive`, `--id-field NAME`, `--no-report`, `--out-dir DIR`,
 `--flag-slivers` / `--sliver-width`, and `--flag-overlaps` / `--min-overlap-area`.
@@ -207,7 +227,7 @@ For each feature with a polygon-like input:
 ## Requirements
 
 - Python 3.9+
-- [`geopandas`](https://geopandas.org/) >= 0.13
+- [`geopandas`](https://geopandas.org/) >= 0.13 (with [`pyogrio`](https://pyogrio.readthedocs.io/))
 - [`shapely`](https://shapely.readthedocs.io/) >= 2.0
 
 See [`requirements.txt`](requirements.txt) for the exact constraints.

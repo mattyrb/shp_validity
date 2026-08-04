@@ -221,6 +221,31 @@ overwrite confirmation, `--recursive` to include subfolders, and
 attribute schema is preserved by default so fixed files stay drop-in
 compatible with existing joins and models.
 
+## GeoPackage input
+
+GeoPackages work the same way as shapefiles. A single-layer `.gpkg` needs no
+extra options; for a multi-layer file, pick the layer interactively or pass
+`--layer`:
+
+```bash
+python shp_validity.py nm_water.gpkg --layer field_boundaries
+```
+
+Console output labels the source as `file.gpkg:layer`, and side outputs land
+as layers in a companion GeoPackage next to the report:
+
+```
+Reading: nm_water.gpkg:field_boundaries
+  Wrote 3 valid features:
+    nm_water_cleaned.gpkg:field_boundaries_valid
+  Wrote rejected features to:
+    nm_water_cleaned.gpkg:field_boundaries_rejected_poly  (1 features)
+```
+
+With `--one-shot`, only the target layer is rewritten in the original
+GeoPackage; other layers are untouched, and the whole `.gpkg` is copied to the
+backup folder first. Batch mode picks up `.shp` and `.gpkg` files together.
+
 ## Re-running
 
 Re-running the script silently overwrites the contents of `cleaned/`.

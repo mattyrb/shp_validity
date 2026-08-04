@@ -223,6 +223,10 @@ LINE_TYPES = ("LineString", "MultiLineString")
 POINT_TYPES = ("Point", "MultiPoint")
 
 
+# Square meters per acre, for converting summary areas to acres.
+SQM_PER_ACRE = 4046.8564224
+
+
 # Status tags written in full to the CSV audit report.
 REPAIRED_STATUSES = {
     "repaired_make_valid",
@@ -465,6 +469,36 @@ def find_overlaps(gdf, min_area: float = 0.0):
     return overlap_area, overlap_count, pairs
 
 
+def find_duplicates(gdf):
+    """Group features whose geometries are exactly identical.
+
+    Geometries are normalized (consistent ring order / orientation) and
+    compared by their binary representation, so re-digitized copies with the
+    same vertices in a different order still match. Returns a dict mapping
+    gdf index -> (group_id, is_extra) for every member of a duplicate group,
+    where is_extra is False for the first occurrence and True for the
+    redundant copies.
+    """
+    seen: dict[bytes, list] = {}
+    for idx, geom in zip(gdf.index, gdf.geometry):
+        if not _is_geometry(geom) or geom.is_empty:
+            continue
+        try:
+            key = shapely.normalize(geom).wkb
+        except Exception:
+            continue
+        seen.setdefault(key, []).append(idx)
+
+    dup_map = {}
+    gid = 0
+    for idxs in seen.values():
+        if len(idxs) > 1:
+            gid += 1
+            for i, idx in enumerate(idxs):
+                dup_map[idx] = (gid, i > 0)
+    return dup_map
+
+
 # Parts smaller than this (CRS units squared) are treated as degenerate
 # "orphaned vertex" debris and dropped regardless of the user threshold.
 DEGENERATE_AREA_EPS = 1e-6
@@ -592,6 +626,7 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
                       add_repaired_field: bool = True,
                       flag_slivers: bool = False, sliver_width: float = 0.0,
                       flag_overlaps: bool = False, min_overlap_area: float = 0.0,
+                      flag_duplicates: bool = False,
                       clean_parts: bool = False, min_part_area: float = 0.0,
                       id_field="__prompt__", interactive: bool = True,
                       out_dir: Path = None, in_place: bool = False,
@@ -625,12 +660,20 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
     # --- CRS classification + sanity checks --------------------------------
     crs_kind = "none"
     crs_units = "unknown"
+    acres_per_unit2 = None
     if gdf.crs is not None:
         crs_kind = "geographic" if gdf.crs.is_geographic else "projected"
         try:
             crs_units = gdf.crs.axis_info[0].unit_name
         except Exception:
             crs_units = "unknown"
+        if not gdf.crs.is_geographic:
+            try:
+                # meters per CRS unit -> acres per square CRS unit
+                f = gdf.crs.axis_info[0].unit_conversion_factor
+                acres_per_unit2 = (f * f) / SQM_PER_ACRE
+            except Exception:
+                acres_per_unit2 = None
 
     if gdf.crs is None:
         print("\n  WARNING: this shapefile has no CRS (the .prj file is")
@@ -661,6 +704,7 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
     sliver_field = None
     ov_area_field = None
     ov_n_field = None
+    dup_field = None
     parts_drop_field = None
     if add_repaired_field:
         repaired_field = pick_unique_field_name(gdf, "repaired")
@@ -678,6 +722,9 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
                 gdf, "ov_area", ["ovlap_area", "ov_area2"])
             ov_n_field = pick_unique_field_name(
                 gdf, "ov_n", ["ov_count", "ovlap_n"])
+        if flag_duplicates:
+            dup_field = pick_unique_field_name(
+                gdf, "dup_grp", ["dup_group", "dupgrp"])
 
     # Determine the feature-identifier column for the report.
     if id_field == "__prompt__":
@@ -763,6 +810,10 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
             report_row["ov_area"] = 0.0 if repaired_geom is not None else ""
             report_row["ov_n"] = 0 if repaired_geom is not None else ""
 
+        if flag_duplicates:
+            report_row["dup_grp"] = 0 if repaired_geom is not None else ""
+            report_row["duplicate"] = False if repaired_geom is not None else ""
+
         report_row["validity_msg"] = validity_msg
         report_rows.append(report_row)
         report_by_idx[row_idx] = report_row
@@ -803,11 +854,17 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
     n_overlapping = None
     total_overlap_area = 0.0
     overlap_pairs = []
+    n_dup_features = None
+    n_dup_groups = 0
+    dup_extra_area = 0.0
+    dup_map = {}
 
     # --- Valid output ------------------------------------------------------
+    valid_area_total = 0.0
     if valid_rows:
         valid_gdf = gpd.GeoDataFrame(valid_rows, crs=gdf.crs)
         valid_gdf["geometry"] = valid_gdf.geometry.apply(_to_multipart)
+        valid_area_total = float(valid_gdf.geometry.area.sum())
 
         # --- Overlap detection among valid features ------------------------
         if flag_overlaps:
@@ -825,6 +882,22 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
                     round(overlap_area.get(i, 0.0), 4) for i in valid_gdf.index]
                 valid_gdf[ov_n_field] = [
                     overlap_count.get(i, 0) for i in valid_gdf.index]
+
+        # --- Duplicate-geometry detection among valid features -------------
+        if flag_duplicates:
+            dup_map = find_duplicates(valid_gdf)
+            n_dup_features = len(dup_map)
+            n_dup_groups = len({g for g, _x in dup_map.values()})
+            for idx, (grp, is_extra) in dup_map.items():
+                rr = report_by_idx.get(idx)
+                if rr is not None:
+                    rr["dup_grp"] = grp
+                    rr["duplicate"] = is_extra
+                if is_extra:
+                    dup_extra_area += float(valid_gdf.geometry.loc[idx].area)
+            if add_repaired_field and dup_field is not None:
+                valid_gdf[dup_field] = [
+                    dup_map.get(i, (0, False))[0] for i in valid_gdf.index]
 
         if in_place:
             if backup_dir is not None:
@@ -916,6 +989,29 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
                                 out_gpkg, layer)
             print(f"    {name}  ({len(zones):,} overlap zones)")
 
+    # --- Duplicates output -------------------------------------------------
+    if flag_duplicates and dup_map:
+        id_lookup = gdf[id_field].to_dict() if id_field is not None else None
+        dup_csv = cleaned_dir / f"{base}_duplicates.csv"
+        fld = ["group", "row_idx"]
+        if id_field is not None:
+            fld.append(id_field)
+        fld += ["is_extra_copy", "area"]
+        with open(dup_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fld)
+            writer.writeheader()
+            for idx in sorted(dup_map, key=lambda i: (dup_map[i][0], i)):
+                grp, is_extra = dup_map[idx]
+                rowd = {"group": grp, "row_idx": idx,
+                        "is_extra_copy": is_extra,
+                        "area": round(float(valid_gdf.geometry.loc[idx].area), 4)}
+                if id_field is not None:
+                    rowd[id_field] = id_lookup.get(idx)
+                writer.writerow(rowd)
+        print(f"  Found {n_dup_features:,} duplicate feature(s) "
+              f"in {n_dup_groups:,} group(s):")
+        print(f"    {dup_csv.name}")
+
     # --- Audit report ------------------------------------------------------
     if write_report:
         report_path = cleaned_dir / f"{base}_report.csv"
@@ -929,6 +1025,8 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
             fieldnames += ["width", "thinness", "sliver"]
         if flag_overlaps:
             fieldnames += ["ov_area", "ov_n"]
+        if flag_duplicates:
+            fieldnames += ["dup_grp", "duplicate"]
         fieldnames += ["validity_msg"]
 
         with open(report_path, "w", newline="", encoding="utf-8") as f:
@@ -949,7 +1047,12 @@ def process_shapefile(shp_path: Path, write_report: bool = True,
         "total_overlap_area": total_overlap_area,
         "n_part_features": n_part_features if clean_parts else None,
         "dropped_area_total": dropped_area_total,
+        "n_dup_features": n_dup_features,
+        "n_dup_groups": n_dup_groups,
+        "dup_extra_area": dup_extra_area,
         "n_valid": len(valid_rows),
+        "valid_area_total": valid_area_total,
+        "acres_per_unit2": acres_per_unit2,
         "n_rejected": len(rejected_records),
         "base": base,
         "layer": layer,
@@ -981,16 +1084,31 @@ def print_summary(report_rows, meta=None):
 
     if meta:
         units = meta.get("crs_units", "units")
+        acre_f = meta.get("acres_per_unit2")
+
+        def fmt_area(v):
+            if acre_f is not None:
+                return f"{v * acre_f:,.2f} acres"
+            return f"{v:,.2f} {units}^2"
+
+        if meta.get("n_valid") is not None:
+            print(f"\n  Valid feature area:           "
+                  f"{fmt_area(meta.get('valid_area_total', 0.0))}")
         if meta.get("n_slivers") is not None:
-            print(f"\n  Thin sliver features flagged: {meta['n_slivers']:,} "
+            print(f"  Thin sliver features flagged: {meta['n_slivers']:,} "
                   f"(mean width < {meta.get('sliver_width')} {units})")
         if meta.get("n_overlapping") is not None:
             print(f"  Features with overlaps:       {meta['n_overlapping']:,}")
             print(f"  Total overlap area:           "
-                  f"{meta.get('total_overlap_area', 0):,.2f} {units}^2")
+                  f"{fmt_area(meta.get('total_overlap_area', 0))}")
         if meta.get("n_part_features") is not None:
             print(f"  Multipart features cleaned:   {meta['n_part_features']:,} "
-                  f"(area removed: {meta.get('dropped_area_total', 0):,.4f} {units}^2)")
+                  f"(area removed: {fmt_area(meta.get('dropped_area_total', 0))})")
+        if meta.get("n_dup_features") is not None:
+            print(f"  Duplicate geometries:         "
+                  f"{meta['n_dup_features']:,} feature(s) in "
+                  f"{meta['n_dup_groups']:,} group(s) "
+                  f"(redundant area: {fmt_area(meta.get('dup_extra_area', 0))})")
     print()
 
 
@@ -1188,6 +1306,10 @@ def _run_interactive():
             "  Minimum overlap area to flag in CRS units squared (0 = any overlap)",
             default=0.0)
 
+    flag_duplicates = prompt_yes_no(
+        "Check for duplicate geometries (identical shapes double-count area)?",
+        default=False)
+
     clean_parts = prompt_yes_no(
         "Clean degenerate / sliver parts out of multipart polygons?", default=False)
     min_part_area = 0.0
@@ -1205,6 +1327,7 @@ def _run_interactive():
         sliver_width=sliver_width,
         flag_overlaps=flag_overlaps,
         min_overlap_area=min_overlap_area,
+        flag_duplicates=flag_duplicates,
         clean_parts=clean_parts,
         min_part_area=min_part_area,
     )
@@ -1255,6 +1378,9 @@ def _build_arg_parser():
                    help="Check for overlapping polygons (sidecar report only).")
     p.add_argument("--min-overlap-area", type=float, default=0.0,
                    help="Minimum overlap area to flag, CRS units squared.")
+    p.add_argument("--flag-duplicates", action="store_true",
+                   help="Check for exactly duplicated geometries (sidecar "
+                        "CSV lists the groups).")
     p.add_argument("--dry-run", action="store_true",
                    help="With --batch, list what would happen without writing.")
     p.add_argument("-y", "--yes", action="store_true",
@@ -1277,6 +1403,7 @@ def main():
         sliver_width=args.sliver_width,
         flag_overlaps=args.flag_overlaps,
         min_overlap_area=args.min_overlap_area,
+        flag_duplicates=args.flag_duplicates,
         clean_parts=not args.no_clean_parts,
         min_part_area=args.min_part_area,
         id_field=args.id_field if args.id_field else None,

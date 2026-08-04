@@ -168,6 +168,22 @@ The width metric flags a 2 m wide artifact while leaving a legitimately long,
 Run on a geographic (degree) layer, the script warns first that area, width,
 and overlap values will not be meaningful.
 
+## Duplicate geometries and acres
+
+Answer yes to the duplicates prompt (or pass `--flag-duplicates`) to find
+identical stacked polygons. The summary reports areas in acres when the CRS
+is projected:
+
+```
+  Valid feature area:           19.77 acres
+  Duplicate geometries:         4 feature(s) in 2 group(s) (redundant area: 4.94 acres)
+```
+
+`<name>_duplicates.csv` lists each group; the first occurrence is unflagged
+and the extra copies have `is_extra_copy = True`, so filtering the report on
+`duplicate = True` (or the `dup_grp` field in the output) isolates the
+redundant features.
+
 ## Cleaning multipart parts
 
 If your data has multipart polygons where one part is good and another is a

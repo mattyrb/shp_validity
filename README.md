@@ -21,6 +21,8 @@ more shapefiles, pick the one to clean, and it produces a tidy
 - Optionally adds a boolean `repaired` field to the valid output so you can filter / symbolize repaired features in QGIS or ArcGIS. Decline the prompt to keep the output attributes identical to the input (repair status is still recorded in the CSV report).
 - Flags thin "sliver" polygons by characteristic width (`2 * area / perimeter`), catching overlay artifacts that are thin but still cover real area, while leaving legitimately long, wide fields alone. Writes a separate slivers file for review.
 - Flags overlapping polygons (which double-count ET and applied water), with per-feature overlap area, a pair list, and the overlap geometries as a layer you can open on a map.
+- Checks for duplicate geometries (identical shapes stacked on each other, the extreme double-count case), grouped and listed in a sidecar CSV with the redundant area.
+- Reports summary area statistics in acres (valid feature area, overlap area, removed part area, redundant duplicate area), converted from the layer's projected CRS units; falls back to raw CRS units when the CRS is geographic or missing.
 - Warns when the layer is in a geographic CRS (degrees), since area, sliver width, and overlap area are then not meaningful for water calculations, and logs the CRS in the run summary.
 - Cleans degenerate / sliver parts out of multipart polygons (the classic "one good part plus a couple of orphaned vertices" artifact): explodes each multipart, repairs each part, drops the junk, reassembles, and writes the removed parts to a side file for review.
 - Runs interactively on one file, or non-interactively in bulk over a directory with `--batch`, including a one-shot `--one-shot` fix that overwrites the originals after backing them up.
@@ -139,6 +141,7 @@ All outputs land in a `cleaned/` subdirectory next to the input shapefile:
 | `<name>_rejected_point.shp` | Filtered `(Multi)Point` features (only created if any exist). |
 | `<name>_slivers.shp` | Thin sliver features flagged for review (only when sliver flagging is on and any are found). |
 | `<name>_overlaps.csv` | Overlapping feature pairs with their overlap area (only when overlap checking is on). |
+| `<name>_duplicates.csv` | Duplicate-geometry groups with row index, identifier, and area (only when duplicate checking is on). |
 | `<name>_overlap_zones.shp` | The overlap geometries themselves, for map review (only when overlap checking is on). |
 | `<name>_removed_parts.shp` | Degenerate / sliver parts removed from multipart features, with the parent row index and part area (only when part cleanup is on and any are removed). |
 | `<name>_report.csv` | Per-feature audit log — the place to look up exactly why a feature ended up where it did. |
@@ -147,7 +150,8 @@ The CSV report contains one row per input feature with the columns:
 `row_idx`, `<your_id_field>` (if you picked one), `original_type`,
 `was_valid`, `status`, `repaired`, then `parts_drop`, `drop_area` (when part
 cleanup is on), `width`, `thinness`, `sliver` (when sliver flagging is on),
-`ov_area`, `ov_n` (when overlap checking is on), and finally `validity_msg`.
+`ov_area`, `ov_n` (when overlap checking is on), `dup_grp`, `duplicate` (when
+duplicate checking is on), and finally `validity_msg`.
 
 The `status` column uses these descriptive tags:
 
@@ -188,6 +192,20 @@ overlap area and neighbor count, writes the overlapping pairs to
 `<name>_overlap_zones.shp` so you can see exactly where they are on a map. This
 flags overlaps for review; it does not resolve them, so you decide how to assign
 or erase the shared area.
+
+**Duplicate geometries.** Merged or re-delivered datasets sometimes carry the
+same polygon twice, which double-counts ET and applied water exactly. The check
+normalizes each geometry (so a copy with reversed vertex order still matches)
+and groups identical shapes. Group membership goes to the report (`dup_grp`,
+`duplicate`), a sidecar CSV lists every group with areas, and the summary
+reports the redundant area. The first occurrence in each group is kept
+unflagged so you can filter out the extras with `"duplicate" = 1`.
+
+**Acres in the summary.** Area statistics in the run summary (valid feature
+area, overlap area, removed part area, redundant duplicate area) are converted
+to acres from the layer's projected CRS units, including US survey feet. The
+CSV reports keep raw CRS units for precision. Geographic or missing CRS falls
+back to raw units with a warning.
 
 **Multipart part cleanup.** A multipart polygon can carry a perfectly good part
 alongside a degenerate one, such as a couple of orphaned vertices left by an
